@@ -1,0 +1,182 @@
+{
+  "Comment": "Pipeline de sismos de Chile: USGS -> bronze -> silver (Iceberg) -> verificación. Input: {reproceso, capas, start, end}; con reproceso false (o sin él) es el flujo normal y las fechas se ignoran",
+  "StartAt": "ModoEjecucion",
+  "States": {
+    "ModoEjecucion": {
+      "Comment": "Reproceso apagado por defecto: solo se activa con \"reproceso\": true. Con false, capas/start/end se ignoran",
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.reproceso", "IsPresent": true },
+            { "Variable": "$.reproceso", "IsBoolean": true },
+            { "Variable": "$.reproceso", "BooleanEquals": true }
+          ],
+          "Next": "ValidarReproceso"
+        }
+      ],
+      "Default": "Ingest"
+    },
+    "ValidarReproceso": {
+      "Comment": "capas: silver = rehace silver con lo que ya hay en bronze; bronze_silver = vuelve a descargar de USGS",
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.start", "IsPresent": true },
+            { "Variable": "$.start", "IsString": true },
+            { "Variable": "$.end", "IsPresent": true },
+            { "Variable": "$.end", "IsString": true },
+            { "Variable": "$.capas", "IsPresent": true },
+            { "Not": { "Variable": "$.start", "StringEquals": "AAAA-MM-DD" } },
+            { "Not": { "Variable": "$.end", "StringEquals": "AAAA-MM-DD" } },
+            { "Variable": "$.capas", "StringEquals": "silver" }
+          ],
+          "Next": "ListarDiasBronze"
+        },
+        {
+          "And": [
+            { "Variable": "$.start", "IsPresent": true },
+            { "Variable": "$.start", "IsString": true },
+            { "Variable": "$.end", "IsPresent": true },
+            { "Variable": "$.end", "IsString": true },
+            { "Variable": "$.capas", "IsPresent": true },
+            { "Not": { "Variable": "$.start", "StringEquals": "AAAA-MM-DD" } },
+            { "Not": { "Variable": "$.end", "StringEquals": "AAAA-MM-DD" } },
+            { "Variable": "$.capas", "StringEquals": "bronze_silver" }
+          ],
+          "Next": "IngestRango"
+        }
+      ],
+      "Default": "ReprocesoInvalido"
+    },
+    "ReprocesoInvalido": {
+      "Type": "Fail",
+      "Error": "ReprocesoInvalido",
+      "Cause": "Para reprocesar cambia las fechas AAAA-MM-DD por fechas reales y elige capas ('silver' o 'bronze_silver'). Ejemplo: {\"reproceso\": true, \"capas\": \"silver\", \"start\": \"2026-10-01\", \"end\": \"2026-10-08\"}"
+    },
+
+    "Ingest": {
+      "Comment": "Flujo normal: feed de las últimas 24 h de USGS a bronze",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${IngestFunctionArn}",
+        "Payload": {}
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 90,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Fallo" }],
+      "Next": "Transform"
+    },
+    "IngestRango": {
+      "Comment": "Reproceso bronze_silver: vuelve a descargar de USGS los sismos de Chile entre start y end",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${IngestFunctionArn}",
+        "Payload": {
+          "start.$": "$.start",
+          "end.$": "$.end"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 90,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Fallo" }],
+      "Next": "Transform"
+    },
+    "Transform": {
+      "Comment": "Limpieza con pandas + MERGE en la tabla Iceberg. Recibe la key que devolvió Ingest",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TransformFunctionArn}",
+        "Payload": {
+          "key.$": "$.key"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 330,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Fallo" }],
+      "Next": "VerificarSilver"
+    },
+
+    "ListarDiasBronze": {
+      "Comment": "Reproceso silver: qué días de ingesta hay en bronze entre start y end",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TransformFunctionArn}",
+        "Payload": {
+          "accion": "listar_dias",
+          "start.$": "$.start",
+          "end.$": "$.end"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 60,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Fallo" }],
+      "Next": "ReprocesarDias"
+    },
+    "ReprocesarDias": {
+      "Comment": "Un día a la vez (MaxConcurrency 1): dos MERGE en paralelo sobre la misma tabla Iceberg chocan",
+      "Type": "Map",
+      "ItemsPath": "$.dias",
+      "MaxConcurrency": 1,
+      "ItemSelector": {
+        "dia.$": "$$.Map.Item.Value"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "TransformDia",
+        "States": {
+          "TransformDia": {
+            "Comment": "Lee todos los archivos de bronze del día, deduplica y hace MERGE en silver",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${TransformFunctionArn}",
+              "Payload": {
+                "dia.$": "$.dia"
+              }
+            },
+            "OutputPath": "$.Payload",
+            "TimeoutSeconds": 330,
+            "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2 }],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.resultados",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Fallo" }],
+      "Next": "VerificarSilver"
+    },
+
+    "VerificarSilver": {
+      "Comment": "Consulta de control en Athena; .sync espera a que la query termine",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "QueryString": "SELECT count(*) AS filas, count(DISTINCT id) AS sismos_unicos FROM sismos_db.silver_sismos",
+        "WorkGroup": "${AthenaWorkGroup}"
+      },
+      "ResultSelector": {
+        "query_id.$": "$.QueryExecution.QueryExecutionId",
+        "estado.$": "$.QueryExecution.Status.State",
+        "datos_escaneados_bytes.$": "$.QueryExecution.Statistics.DataScannedInBytes"
+      },
+      "ResultPath": "$.verificacion",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Fallo" }],
+      "End": true
+    },
+    "Fallo": {
+      "Type": "Fail",
+      "Error": "PipelineSismosFallo",
+      "Cause": "Un paso del pipeline falló después de los reintentos. Revisa el estado en rojo en el grafo."
+    }
+  }
+}

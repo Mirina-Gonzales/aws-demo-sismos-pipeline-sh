@@ -1,0 +1,26 @@
+# Archivos que NO se suben al repo
+
+# ---------- Credenciales y secretos ----------
+.aws/
+.env
+.env.*
+*.pem
+*.key
+
+# ---------- Ambiente de Python ----------
+.venv/
+__pycache__/
+*.pyc
+
+# ---------- Tests ----------
+.pytest_cache/
+
+# ---------- SAM ----------
+# salida de sam build y de sam package
+.aws-sam/
+packaged.yaml
+
+# ---------- Sistema y editor ----------
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,545 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Demo pipeline de sismos de Sudamérica - AWS Student Community Day Chile 2026
+
+Parameters:
+  AlertEmail:
+    Type: String
+    AllowedPattern: '.+@.+'
+    Description: Email que recibe las alertas del pipeline
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Ejecución automática cada hora (ENABLED solo el día del evento)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    MemorySize: 128
+    Timeout: 60
+    Tags:
+      proyecto: scd-chile-demo
+
+Resources:
+  # ---------- Almacenamiento ----------
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sismos-datalake-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expira-bronze
+            Status: Enabled
+            Prefix: bronze/
+            ExpirationInDays: 30
+          - Id: expira-resultados-athena
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+          - Id: expira-temporales
+            Status: Enabled
+            Prefix: tmp/
+            ExpirationInDays: 1
+          - Id: limpia-subidas-incompletas
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  # ---------- Catálogo y consultas ----------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: sismos_db
+        Description: Data lake de sismos de Sudamérica (silver y gold)
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: scd-demo
+      Description: Workgroup de la demo de sismos (con límite de datos escaneados)
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824   # máximo 1 GB por query
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${DataLakeBucket}/athena-results/
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+  # ---------- Bronze: ingesta ----------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sismos-ingest
+      Description: Descarga el feed de sismos de USGS y lo guarda tal cual en bronze
+      CodeUri: src/ingest/
+      Handler: app.handler
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataLakeBucket
+          FEED_URL: https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${DataLakeBucket}/bronze/*
+
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/sismos-ingest
+      RetentionInDays: 7
+
+  # ---------- Silver: limpieza + Iceberg ----------
+  TransformFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sismos-transform
+      Description: Limpia un archivo de bronze y hace MERGE en la tabla Iceberg de silver
+      CodeUri: src/transform/
+      Handler: app.handler
+      MemorySize: 1024
+      Timeout: 300
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python312-Arm64:31
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataLakeBucket
+          GLUE_DATABASE: !Ref GlueDatabase
+          SILVER_TABLE: silver_sismos
+          ATHENA_WORKGROUP: !Ref AthenaWorkGroup
+      Policies:
+        - Statement:
+            - Sid: LeerBronze
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataLakeBucket}/bronze/*
+            - Sid: EscribirSilverTemporalesYResultados
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:AbortMultipartUpload
+              Resource:
+                - !Sub arn:aws:s3:::${DataLakeBucket}/silver/*
+                - !Sub arn:aws:s3:::${DataLakeBucket}/tmp/*
+                - !Sub arn:aws:s3:::${DataLakeBucket}/athena-results/*
+            - Sid: ListarBucket
+              Effect: Allow
+              Action:
+                - s3:ListBucket
+                - s3:GetBucketLocation
+              Resource: !Sub arn:aws:s3:::${DataLakeBucket}
+            - Sid: CatalogoGlue
+              Effect: Allow
+              Action:
+                - glue:GetDatabase
+                - glue:GetDatabases
+                - glue:GetTable
+                - glue:GetTables
+                - glue:UpdateTable          # el commit de Iceberg actualiza la tabla
+                - glue:GetPartition
+                - glue:GetPartitions
+                - glue:BatchCreatePartition
+                - glue:BatchDeletePartition
+              Resource:
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*
+            - Sid: SoloTablasTemporalesDelMerge
+              # Las tablas reales las crea solo el flujo de DDL; la Lambda solo
+              # crea y borra las temporales que awswrangler usa para el MERGE.
+              Effect: Allow
+              Action:
+                - glue:CreateTable
+                - glue:DeleteTable
+              Resource:
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/temp_table_*
+            - Sid: ConsultasAthena
+              Effect: Allow
+              Action:
+                - athena:StartQueryExecution
+                - athena:GetQueryExecution
+                - athena:GetQueryResults
+                - athena:StopQueryExecution
+                - athena:GetWorkGroup
+              Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}
+
+  TransformLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/sismos-transform
+      RetentionInDays: 7
+
+
+  # ---------- Orquestación: Step Functions ----------
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: sismos-pipeline
+      Type: STANDARD
+      DefinitionUri: statemachine/sismos.asl.json
+      DefinitionSubstitutions:
+        IngestFunctionArn: !GetAtt IngestFunction.Arn
+        TransformFunctionArn: !GetAtt TransformFunction.Arn
+        AthenaWorkGroup: !Ref AthenaWorkGroup
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref IngestFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref TransformFunction
+        - Statement:
+            - Sid: ConsultarAthena
+              Effect: Allow
+              Action:
+                - athena:StartQueryExecution
+                - athena:GetQueryExecution
+                - athena:GetQueryResults
+                - athena:StopQueryExecution
+                - athena:GetWorkGroup
+              Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}
+            - Sid: CatalogoAthena
+              Effect: Allow
+              Action: athena:GetDataCatalog
+              Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/*
+            - Sid: CatalogoGlue
+              Effect: Allow
+              Action:
+                - glue:GetDatabase
+                - glue:GetTable
+                - glue:GetTables
+                - glue:GetPartitions
+              Resource:
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*
+            - Sid: LeerSilverYEscribirResultados
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:ListBucket
+                - s3:GetBucketLocation
+              Resource:
+                - !GetAtt DataLakeBucket.Arn
+                - !Sub ${DataLakeBucket.Arn}/silver/*
+                - !Sub ${DataLakeBucket.Arn}/athena-results/*
+      Events:
+        CadaHora:
+          Type: ScheduleV2
+          Properties:
+            Name: sismos-cada-hora
+            ScheduleExpression: rate(1 hour)
+            State: !Ref ScheduleState
+            # Siempre los mismos parámetros: reproceso apagado y fechas de ejemplo (no se usan)
+            Input: '{"reproceso": false, "capas": "silver", "start": "AAAA-MM-DD", "end": "AAAA-MM-DD"}'
+
+  # ---------- DDL: tablas definidas como código ----------
+  # Una carpeta por tabla (ddl/<tabla>/NNN_*.sql). El CI las sube aquí y
+  # la máquina sismos-ddl ejecuta el archivo que le pases.
+  DdlBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sismos-ddl-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  DdlStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: sismos-ddl
+      Type: STANDARD
+      DefinitionUri: statemachine/ddl.asl.json
+      DefinitionSubstitutions:
+        DdlBucket: !Ref DdlBucket
+        DataLakeBucket: !Ref DataLakeBucket
+        AthenaWorkGroup: !Ref AthenaWorkGroup
+        GlueDatabase: !Ref GlueDatabase
+      Policies:
+        - Statement:
+            - Sid: LeerDDL
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub ${DdlBucket.Arn}/*
+            - Sid: ListarDDL
+              # Sin ListBucket, S3 responde AccessDenied (y no NoSuchKey) cuando el archivo no existe
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt DdlBucket.Arn
+            - Sid: ConsultarAthena
+              Effect: Allow
+              Action:
+                - athena:StartQueryExecution
+                - athena:GetQueryExecution
+                - athena:GetQueryResults
+                - athena:StopQueryExecution
+                - athena:GetWorkGroup
+              Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}
+            - Sid: CatalogoAthena
+              Effect: Allow
+              Action: athena:GetDataCatalog
+              Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/*
+            - Sid: CrearYModificarTablas
+              Effect: Allow
+              Action:
+                - glue:GetDatabase
+                - glue:GetTable
+                - glue:GetTables
+                - glue:GetPartitions
+                - glue:CreateTable
+                - glue:UpdateTable
+              Resource:
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}
+                - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*
+            - Sid: MetadataIcebergYResultados
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:ListBucket
+                - s3:GetBucketLocation
+              Resource:
+                - !GetAtt DataLakeBucket.Arn
+                - !Sub ${DataLakeBucket.Arn}/silver/*
+                - !Sub ${DataLakeBucket.Arn}/athena-results/*
+
+  # ---------- Observabilidad: alertas por email ----------
+  AlertasTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: sismos-alertas
+      DisplayName: Alertas pipeline sismos
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  AlarmaIngestErrores:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: sismos-ingest-errores
+      AlarmDescription: La Lambda de ingesta falló (USGS no respondió o error en el código)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertasTopic
+
+  AlarmaTransformErrores:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: sismos-transform-errores
+      AlarmDescription: La Lambda de limpieza / MERGE falló
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransformFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertasTopic
+
+  AlarmaPipelineFallido:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: sismos-pipeline-fallido
+      AlarmDescription: Una ejecución de la máquina de estados terminó en Fallo (después de los reintentos)
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref PipelineStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertasTopic
+  # ---------- Gold: queries guardadas para la demo ----------
+  Query01Panorama:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 01 Panorama general
+      Description: Cuántos sismos, desde cuándo y el más fuerte
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT count(*)               AS sismos,
+               count(DISTINCT pais)   AS paises,
+               count(DISTINCT region) AS localidades,
+               min(time_cl)           AS primer_sismo,
+               max(time_cl)           AS ultimo_sismo,
+               max(mag)               AS mag_maxima
+        FROM sismos_db.silver_sismos;
+
+  Query02DondeTiembla:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 02 Donde tiembla mas
+      Description: Top 10 localidades con más sismos, con su país
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT pais, region, sismos, sismos_4_o_mas, mag_promedio, mag_maxima
+        FROM sismos_db.gold_sismos_por_region
+        ORDER BY sismos DESC
+        LIMIT 10;
+
+  Query03PorDia:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 03 Actividad por dia
+      Description: Sismos por día en toda Sudamérica (fecha de Chile)
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT event_date,
+               sum(sismos)         AS sismos,
+               sum(sismos_4_o_mas) AS sismos_4_o_mas,
+               max(mag_maxima)     AS mag_maxima,
+               count(*)            AS paises
+        FROM sismos_db.gold_sismos_por_dia
+        GROUP BY event_date
+        ORDER BY event_date DESC
+        LIMIT 30;
+
+  Query04DuranteLaCharla:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 04 Durante la charla
+      Description: Sismos ocurridos en los últimos 60 minutos
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT pais, region, mag, depth_km, time_cl, minutos_atras
+        FROM sismos_db.gold_sismos_recientes
+        WHERE minutos_atras <= 60
+        ORDER BY time_cl DESC;
+
+  Query05TimeTravel:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 05 Time travel
+      Description: La tabla hace 30 minutos vs ahora (Iceberg)
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT 'hace 30 min' AS momento, count(*) AS sismos
+        FROM sismos_db.silver_sismos
+        FOR TIMESTAMP AS OF (current_timestamp - INTERVAL '30' MINUTE)
+        UNION ALL
+        SELECT 'ahora', count(*)
+        FROM sismos_db.silver_sismos;
+
+  Query06SinDuplicados:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 06 Sin duplicados
+      Description: Prueba de que el MERGE no duplica
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT count(*) AS filas, count(DISTINCT id) AS sismos_unicos
+        FROM sismos_db.silver_sismos;
+
+  Query07Historial:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 07 Historial de la tabla
+      Description: Snapshots de Iceberg (cada corrida del pipeline)
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT committed_at,
+               operation,
+               summary['added-records'] AS agregadas,
+               summary['total-records'] AS totales
+        FROM "sismos_db"."silver_sismos$snapshots"
+        ORDER BY committed_at DESC
+        LIMIT 20;
+  Query08PorPais:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: 08 Por pais
+      Description: Qué país de Sudamérica tiembla más
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT pais, sismos, sismos_4_o_mas, mag_promedio, mag_maxima, ultimo_sismo_cl
+        FROM sismos_db.gold_sismos_por_pais
+        ORDER BY sismos DESC;
+
+Outputs:
+  DataLakeBucketName:
+    Description: Bucket del data lake (bronze, silver, athena-results)
+    Value: !Ref DataLakeBucket
+  IngestFunctionName:
+    Description: Lambda de ingesta (bronze)
+    Value: !Ref IngestFunction
+  TransformFunctionName:
+    Description: Lambda de limpieza (silver)
+    Value: !Ref TransformFunction
+  AthenaWorkGroupName:
+    Description: Workgroup de Athena para consultar
+    Value: !Ref AthenaWorkGroup
+  StateMachineArn:
+    Description: Máquina de estados que orquesta el pipeline
+    Value: !Ref PipelineStateMachine
+  AlertasTopicArn:
+    Description: Tópico SNS de alertas
+    Value: !Ref AlertasTopic
+  DdlBucketName:
+    Description: Bucket con los DDL de las tablas (una carpeta por tabla)
+    Value: !Ref DdlBucket
+  DdlStateMachineArn:
+    Description: Máquina de estados que ejecuta un DDL
+    Value: !Ref DdlStateMachine

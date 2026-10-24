@@ -1,0 +1,62 @@
+{
+  "Comment": "Ejecuta un DDL guardado en S3: {carpeta, archivo} -> s3://<bucket-ddl>/<carpeta>/<archivo> -> Athena (una sentencia por archivo)",
+  "QueryLanguage": "JSONata",
+  "StartAt": "ValidarInput",
+  "States": {
+    "ValidarInput": {
+      "Comment": "El input debe traer carpeta y archivo, p. ej. {\"carpeta\": \"table_silver_sismos\", \"archivo\": \"001_create.sql\"}",
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $type($states.input.carpeta) = 'string' and $type($states.input.archivo) = 'string' and $length($states.input.carpeta) > 0 and $length($states.input.archivo) > 0 %}",
+          "Next": "LeerDDL"
+        }
+      ],
+      "Default": "InputInvalido"
+    },
+    "InputInvalido": {
+      "Type": "Fail",
+      "Error": "InputInvalido",
+      "Cause": "Falta 'carpeta' o 'archivo'. Ejemplo de input: {\"carpeta\": \"table_silver_sismos\", \"archivo\": \"001_create.sql\"}"
+    },
+    "LeerDDL": {
+      "Comment": "Lee el archivo .sql, quita comentarios y el ';' final, y reemplaza el bucket",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Arguments": {
+        "Bucket": "${DdlBucket}",
+        "Key": "{% $states.input.carpeta & '/' & $states.input.archivo %}"
+      },
+      "Output": {
+        "carpeta": "{% $states.input.carpeta %}",
+        "archivo": "{% $states.input.archivo %}",
+        "sql": "{% $trim($replace($replace($replace($states.result.Body, /--[^\\n]*/, ''), /;\\s*$/, ''), '{{BUCKET_DATALAKE}}', '${DataLakeBucket}')) %}"
+      },
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Output": "{% $states.errorOutput %}", "Next": "Fallo" }],
+      "Next": "EjecutarDDL"
+    },
+    "EjecutarDDL": {
+      "Comment": "Corre el DDL en Athena; .sync espera a que termine y falla si la query falla",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "{% $states.input.sql %}",
+        "WorkGroup": "${AthenaWorkGroup}",
+        "QueryExecutionContext": { "Database": "${GlueDatabase}" }
+      },
+      "Output": {
+        "carpeta": "{% $states.input.carpeta %}",
+        "archivo": "{% $states.input.archivo %}",
+        "query_id": "{% $states.result.QueryExecution.QueryExecutionId %}",
+        "estado": "{% $states.result.QueryExecution.Status.State %}"
+      },
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Output": "{% $states.errorOutput %}", "Next": "Fallo" }],
+      "End": true
+    },
+    "Fallo": {
+      "Type": "Fail",
+      "Error": "{% $states.input.Error %}",
+      "Cause": "{% $states.input.Cause %}"
+    }
+  }
+}

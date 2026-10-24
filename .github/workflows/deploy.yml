@@ -1,0 +1,75 @@
+name: CI/CD pipeline sismos
+
+on:
+  # Solo manual: Actions → CI/CD pipeline sismos → Run workflow → rama main
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # para pedir el token OIDC
+  contents: read
+
+concurrency:
+  group: deploy-sismos
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: 1. Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -v
+
+  deploy:
+    name: 2. Build, deploy y subir DDL
+    needs: test        # si un test falla, esto NO corre
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - name: Solo se despliega desde main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::El deploy solo se permite desde main (elegiste ${GITHUB_REF_NAME})"
+          exit 1
+      - name: Revisar la variable AWS_ROLE_ARN
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::Falta la variable AWS_ROLE_ARN (Settings → Secrets and variables → Actions → Variables)"
+            exit 1
+          fi
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Variable del repo (Settings → Secrets and variables → Actions → Variables): así la cuenta no queda en el código
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - run: sam build
+      - name: Email de alertas desde el secret ALERT_EMAIL
+        # En el repo, config/demo.toml trae un email de ejemplo; el real se pone solo aquí
+        env:
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          if [ -z "$ALERT_EMAIL" ]; then
+            echo "::error::Falta el secret ALERT_EMAIL (Settings → Secrets and variables → Actions → Secrets)"
+            exit 1
+          fi
+          sed -i "s|tu-correo@ejemplo.com|${ALERT_EMAIL}|" config/demo.toml
+          grep -q "tu-correo@ejemplo.com" config/demo.toml && { echo "::error::No se reemplazó el email"; exit 1; } || true
+      - run: sam deploy --config-file config/demo.toml --no-confirm-changeset --no-fail-on-empty-changeset
+      - name: Subir DDL al bucket
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks --stack-name sismos-pipeline \
+            --query "Stacks[0].Outputs[?OutputKey=='DdlBucketName'].OutputValue" --output text)
+          aws s3 sync ddl/ "s3://${BUCKET}/" --exclude "*" --include "*.sql"
+          # Solo se suben: las tablas y vistas se crean con la máquina sismos-ddl

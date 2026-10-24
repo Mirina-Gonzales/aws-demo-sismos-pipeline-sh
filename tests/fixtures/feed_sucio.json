@@ -1,0 +1,66 @@
+{
+  "type": "FeatureCollection",
+  "metadata": {"title": "Fixture de prueba con casos difíciles", "count": 8},
+  "features": [
+    {
+      "type": "Feature",
+      "id": "us001",
+      "properties": {"mag": 4.6, "place": "45 km W of Calama, Chile", "time": 1795184100000, "updated": 1795184400000, "tsunami": 0, "magType": "mb"},
+      "geometry": {"type": "Point", "coordinates": [-69.4, -22.4, 110.5]}
+    },
+    {
+      "type": "Feature",
+      "id": "us001",
+      "properties": {"mag": 4.4, "place": "45 km W of Calama, Chile", "time": 1795184100000, "updated": 1795184160000, "tsunami": 0, "magType": "ml"},
+      "geometry": {"type": "Point", "coordinates": [-69.4, -22.4, 110.5]}
+    },
+    {
+      "type": "Feature",
+      "id": "ak002",
+      "properties": {"mag": 3.0, "place": "12 km NNE of Anchorage, Alaska", "time": 1795176000000, "updated": 1795176000000, "tsunami": 0, "magType": "ml"},
+      "geometry": {"type": "Point", "coordinates": [-149.8, 61.3, 40.0]}
+    },
+    {
+      "type": "Feature",
+      "id": "us003",
+      "properties": {"mag": 5.1, "place": "off the coast of Coquimbo, Chile", "time": 1795141800000, "updated": 1795141800000, "tsunami": 1, "magType": "Mww"},
+      "geometry": {"type": "Point", "coordinates": [-71.8, -30.1, 35.0]}
+    },
+    {
+      "type": "Feature",
+      "id": "us004",
+      "properties": {"mag": 3.1, "place": "Chile-Argentina border region", "time": 1795118400000, "updated": null, "tsunami": null, "magType": "mb"},
+      "geometry": {"type": "Point", "coordinates": [-68.9, -24.1, 180.0]}
+    },
+    {
+      "type": "Feature",
+      "id": "us005",
+      "properties": {"mag": null, "place": "33 km SW of Iquique, Chile", "time": 1795168800000, "updated": 1795168800000, "tsunami": 0, "magType": "ml"},
+      "geometry": {"type": "Point", "coordinates": [-70.4, -20.5, 60.0]}
+    },
+    {
+      "type": "Feature",
+      "id": "us006",
+      "properties": {"mag": 2.7, "place": "  10 km S of San Pedro de Atacama,  Chile ", "time": 1795168800000, "updated": 1795168800000, "tsunami": 0, "magType": "ml"},
+      "geometry": {"type": "Point", "coordinates": [-68.2, -23.0, 150.0]}
+    },
+    {
+      "type": "Feature",
+      "id": "us007",
+      "properties": {"mag": 2.9, "place": null, "time": 1795168800000, "updated": 1795168800000, "tsunami": 0, "magType": "ml"},
+      "geometry": {"type": "Point", "coordinates": [-71.0, -33.0]}
+    },
+    {
+      "type": "Feature",
+      "id": "pe008",
+      "properties": {"mag": 4.2, "place": "20 km S of Arequipa, Peru", "time": 1795170000000, "updated": 1795170000000, "tsunami": 0, "magType": "mb"},
+      "geometry": {"type": "Point", "coordinates": [-71.5, -16.6, 95.0]}
+    },
+    {
+      "type": "Feature",
+      "id": "pa009",
+      "properties": {"mag": 4.0, "place": "50 km S of Punta de Burica, Panama", "time": 1795171000000, "updated": 1795171000000, "tsunami": 0, "magType": "mb"},
+      "geometry": {"type": "Point", "coordinates": [-82.9, 7.6, 10.0]}
+    }
+  ]
+}

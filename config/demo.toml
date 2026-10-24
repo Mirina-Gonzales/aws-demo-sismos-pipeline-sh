@@ -1,0 +1,15 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "sismos-pipeline"
+
+[default.deploy.parameters]
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+confirm_changeset = true
+tags = "proyecto=\"scd-chile-demo\""
+# El día del evento: cambia ScheduleState a "ENABLED", haz push y lanza el deploy en Actions.
+# AlertEmail queda de ejemplo: el real lo pone GitHub Actions desde el secret ALERT_EMAIL.
+# No escribas tu email aquí (el repo es público).
+parameter_overrides = "AlertEmail=\"tu-correo@ejemplo.com\" ScheduleState=\"ENABLED\""

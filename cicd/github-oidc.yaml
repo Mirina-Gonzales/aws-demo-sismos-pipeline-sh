@@ -1,0 +1,50 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Rol OIDC para que GitHub Actions despliegue el pipeline de sismos (sin access keys)
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: Tu usuario (u organización) de GitHub, dueño del repo que va a desplegar
+  RepoName:
+    Type: String
+    Description: El nombre de tu repo o fork, tal cual aparece en GitHub
+  BranchName:
+    Type: String
+    Default: main
+    Description: Rama que puede desplegar (main por defecto; '*' = cualquier rama, no recomendado en un repo público)
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: sismos-github-deploy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub repo:${GitHubOwner}/${RepoName}:ref:refs/heads/${BranchName}
+                  - !Sub repo:${GitHubOwner}@*/${RepoName}@*:ref:refs/heads/${BranchName}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt GitHubDeployRole.Arn
